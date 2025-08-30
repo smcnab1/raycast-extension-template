@@ -1,4 +1,4 @@
-name: Configure Extension Variables
+name: Configure Extension Variables + Replace Placeholders
 
 on:
   workflow_dispatch:
@@ -54,126 +54,368 @@ on:
           👤 Raycast username/organisation (defaults to GitHub owner if omitted)
         required: false
         type: string
+      # --- replacement controls ---
+      branch_filter:
+        description: "Regex of branches to include (e.g. ^(main|dev|release/).*)"
+        required: false
+        type: string
+        default: ".*"
+      exclude_branches:
+        description: "Regex of branches to exclude"
+        required: false
+        type: string
+        default: "^(gh-pages|dependabot/.*)$"
+      dry_run:
+        description: "Dry run (report only, no commits/PRs)"
+        required: true
+        type: boolean
+        default: false
+
 
 permissions:
-  actions: write   # needed to create/update repository Variables
-  contents: read
+  actions: write
+  contents: write
+  pull-requests: write
 
 jobs:
   set-variables:
     name: Set repository variables
     runs-on: ubuntu-latest
+    outputs:
+      EXTENSION_NAME: ${{ steps.compute.outputs.EXTENSION_NAME }}
+      EXTENSION_DESC: ${{ steps.compute.outputs.EXTENSION_DESC }}
+      EXTENSION_CATEGORY: ${{ steps.compute.outputs.EXTENSION_CATEGORY }}
+      REPO_NAME: ${{ steps.compute.outputs.REPO_NAME }}
+      RAYCAST_BUG_LINK: ${{ steps.compute.outputs.RAYCAST_BUG_LINK }}
+      RAYCAST_FEEDBACK_LINK: ${{ steps.compute.outputs.RAYCAST_FEEDBACK_LINK }}
     steps:
-      - name: Create/Update variables
+      - name: Create Nexoroid installation token (optional)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.NEXOROID_APP_ID }}
+          private-key: ${{ secrets.NEXOROID_APP_PRIVATE_KEY }}
+
+      - name: Compute & upsert variables
+        id: compute
         uses: actions/github-script@v7
         with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
             const ghOwner = context.repo.owner;
             const ghRepo  = context.repo.repo;
 
-            // Inputs
-            const extName  = core.getInput('extension_name').trim();
-            const repoName = (core.getInput('repo_name') || ghRepo).trim();
-            const extDesc  = core.getInput('extension_desc').trim();
-            const extCat   = core.getInput('extension_category').trim();
-            const feedbackInput = (core.getInput('raycast_feedback_link') || '').trim();
-            const bugInput      = (core.getInput('raycast_bug_link') || '').trim();
-            const raycastUser   = (core.getInput('raycast_username') || ghOwner).trim();
+            // Read workflow_dispatch inputs
+            const inp = context.payload.inputs || {};
+            const s = (k, d='') => (inp[k] ?? d).toString().trim();
+
+            const extName  = s('extension_name');
+            const repoName = s('repo_name', ghRepo) || ghRepo;
+            const extDesc  = s('extension_desc');
+            const extCat   = s('extension_category');
+            const feedbackInput = s('raycast_feedback_link');
+            const bugInput      = s('raycast_bug_link');
+            const raycastUser   = s('raycast_username', ghOwner) || ghOwner;
+
+            // Required guards
+            const missing = [];
+            if (!extName) missing.push('extension_name');
+            if (!extDesc) missing.push('extension_desc');
+            if (!extCat)  missing.push('extension_category');
+            if (missing.length) {
+              core.setFailed(`Required inputs missing/empty: ${missing.join(', ')}`);
+              return;
+            }
 
             // Helpers
-            const isURL = (s) => /^https?:\/\/[^\s]+$/i.test(s);
-            const slugify = (s) =>
-              s.toLowerCase()
-               .normalize('NFKD')
-               .replace(/[\u0300-\u036f]/g, '')   // strip accents
-               .replace(/&/g, ' and ')
-               .replace(/[^a-z0-9]+/g, '-')       // non-alnum to hyphen
-               .replace(/^-+|-+$/g, '')
-               .replace(/-{2,}/g, '-');
+            const isURL = (v) => /^https?:\/\/\S+$/i.test(v);
+            const slugify = (t) => t.toLowerCase()
+              .normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
+              .replace(/&/g,' and ').replace(/[^a-z0-9]+/g,'-')
+              .replace(/^-+|-+$/g,'').replace(/-{2,}/g,'-');
 
-            // Build Raycast page URL from name + username
             const extSlug = slugify(extName);
             const raycastPageUrl = `https://www.raycast.com/${encodeURIComponent(raycastUser)}/${encodeURIComponent(extSlug)}`;
 
-            // If user did not supply links, derive sane defaults that point to raycast/extensions issue templates
-            // Title seed like: "[Luxafor Controller] ..."
+            // Derive links if not provided
             const titleSeed = `[${extName}] ...`;
-
-            const buildIssueURL = (template, labelsCsv) => {
-              const params = new URLSearchParams({
+            const issueURL = (template, labelsCsv) => {
+              const p = new URLSearchParams({
                 title: titleSeed,
                 template,
                 labels: labelsCsv,
-                'extension-url': raycastPageUrl
+                'extension-url': raycastPageUrl,
               });
-              return `https://github.com/raycast/extensions/issues/new?${params.toString()}`;
+              return `https://github.com/raycast/extensions/issues/new?${p.toString()}`;
             };
+            const bugLink = bugInput || issueURL('extension_bug_report.yml', 'extension,bug');
+            const feedbackLink = feedbackInput || issueURL('extension_feature_request.yml', 'extension,feature request');
 
-            const derivedBugLink = buildIssueURL('extension_bug_report.yml', 'extension,bug');
-            const derivedFeatureLink = buildIssueURL('extension_feature_request.yml', 'extension,feature request');
-
-            const bugLink = bugInput || derivedBugLink;
-            const feedbackLink = feedbackInput || derivedFeatureLink;
-
-            // Light validation warnings
+            // Warnings
             const warnings = [];
             if (feedbackInput && !isURL(feedbackInput)) warnings.push('RAYCAST_FEEDBACK_LINK does not look like a valid URL.');
-            if (bugInput && !isURL(bugInput)) warnings.push('RAYCAST_BUG_LINK does not look like a valid URL.');
-            if (extDesc.length > 280) warnings.push('EXTENSION_DESC is quite long (over 280 chars). Consider shortening.');
+            if (bugInput && !isURL(bugInput))         warnings.push('RAYCAST_BUG_LINK does not look like a valid URL.');
+            if (extDesc.length > 280)                 warnings.push('EXTENSION_DESC is quite long (over 280 chars). Consider shortening.');
 
             // Upsert helper
-            async function upsertVariable(owner, repo, name, value) {
-              if (!value && value !== '') {
-                core.info(`Skipping ${name} (undefined).`);
-                return 'skipped';
-              }
+            async function upsert(owner, repo, name, value) {
               try {
                 await github.rest.actions.updateRepoVariable({ owner, repo, name, value });
-                core.info(`Updated ${name}`);
                 return 'updated';
               } catch (err) {
                 if (err.status === 404) {
                   await github.rest.actions.createRepoVariable({ owner, repo, name, value });
-                  core.info(`Created ${name}`);
                   return 'created';
                 }
-                core.setFailed(`Failed to set ${name}: ${err.message}`);
+                if (err.status === 403) {
+                  core.setFailed("403: token cannot write repo Variables. Enable 'Workflow permissions → Read and write', or use a PAT/App token.");
+                } else if (err.status === 422 && String(value).trim() === '') {
+                  core.setFailed(`Failed to set ${name}: value is empty.`);
+                } else {
+                  core.setFailed(`Failed to set ${name}: ${err.message}`);
+                }
               }
             }
 
-            // Apply variables (empty string means "skip" for optional ones? -> here we always set derived links)
-            const toSet = {
+            // Upsert all six vars
+            const map = {
               EXTENSION_NAME: extName,
               EXTENSION_DESC: extDesc,
               EXTENSION_CATEGORY: extCat,
               REPO_NAME: repoName,
               RAYCAST_BUG_LINK: bugLink,
-              RAYCAST_FEEDBACK_LINK: feedbackLink
+              RAYCAST_FEEDBACK_LINK: feedbackLink,
             };
+            for (const [k,v] of Object.entries(map)) {
+              await upsert(ghOwner, repoName, k, v);
+            }
 
-            const results = {};
-            for (const [name, value] of Object.entries(toSet)) {
-              results[name] = await upsertVariable(ghOwner, repoName, name, value);
+            // Expose outputs for next job (don’t rely on vars.* in same run)
+            for (const [k,v] of Object.entries(map)) {
+              core.setOutput(k, v);
             }
 
             // Summary
-            const preview = (v) => (String(v).length > 110 ? String(v).slice(0,107) + '...' : String(v));
+            const preview = (v) => (String(v).length > 110 ? String(v).slice(0,107)+'...' : String(v));
             core.summary
               .addHeading('Repository Variables Updated')
               .addTable([
-                [{ data: 'Name', header: true }, { data: 'Value (preview)', header: true }, { data: 'Action', header: true }],
-                ...Object.entries(toSet).map(([k, v]) => [k, preview(v), results[k] || 'skipped'])
+                [{data:'Name',header:true},{data:'Value (preview)',header:true}],
+                ...Object.entries(map).map(([k,v]) => [k, preview(v)])
               ])
               .addHeading('Derived URLs', 3)
               .addList([
                 `Raycast page: ${raycastPageUrl}`,
-                `Bug link: ${bugLink}`,
-                `Feedback link: ${feedbackLink}`
+                `Bug link: ${map.RAYCAST_BUG_LINK}`,
+                `Feedback link: ${map.RAYCAST_FEEDBACK_LINK}`
               ]);
-
             if (warnings.length) {
               core.summary.addHeading('Warnings', 3).addList(warnings);
-              warnings.forEach(w => core.warning(w));
+              for (const w of warnings) core.warning(w);
             }
-
             await core.summary.write();
+
+  replace:
+    name: Replace placeholders across branches
+    needs: set-variables
+    runs-on: ubuntu-latest
+    if: ${{ needs.set-variables.result == 'success' }}
+
+    steps:
+      - name: Create Nexoroid installation token (optional)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        continue-on-error: true
+        with:
+          app-id: ${{ secrets.NEXOROID_APP_ID }}
+          private-key: ${{ secrets.NEXOROID_APP_PRIVATE_KEY }}
+
+      - name: Pick token
+        id: pick-token
+        run: |
+          if [ -n "${{ steps.app-token.outputs.token }}" ]; then
+            echo "token=${{ steps.app-token.outputs.token }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "token=${{ github.token }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout all branches
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          
+      - name: Ensure scripts directory exists
+        run: |
+          if [ ! -d ".github/scripts" ]; then
+            echo "::error::Scripts directory not found. Please ensure .github/scripts/replace_placeholders.py exists."
+            exit 1
+          fi
+
+      - name: Configure git author
+        run: |
+          git config user.name  "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: List branches to process
+        id: list
+        env:
+          BRANCH_FILTER: ${{ github.event.inputs.branch_filter }}
+          EXCLUDE: ${{ github.event.inputs.exclude_branches }}
+        run: |
+          set -euo pipefail
+          mapfile -t branches < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin | sed 's#^origin/##' | sort -u | grep -v '^HEAD$')
+          wanted=()
+          for b in "${branches[@]}"; do
+            if echo "$b" | grep -Eq "$BRANCH_FILTER" && ! echo "$b" | grep -Eq "$EXCLUDE"; then
+              wanted+=("$b")
+            fi
+          done
+          printf '%s\0' "${wanted[@]}" > /tmp/branches.z
+          echo "count=${#wanted[@]}" >> "$GITHUB_OUTPUT"
+          printf 'branches=%s\n' "$(printf '%s,' "${wanted[@]}" | sed 's/,$//')" >> "$GITHUB_OUTPUT"
+
+      - name: Replace placeholders on each branch
+        env:
+          GH_TOKEN: ${{ steps.pick-token.outputs.token }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          VAL_EXTENSION_NAME:        ${{ needs.set-variables.outputs.EXTENSION_NAME }}
+          VAL_EXTENSION_DESC:        ${{ needs.set-variables.outputs.EXTENSION_DESC }}
+          VAL_EXTENSION_CATEGORY:    ${{ needs.set-variables.outputs.EXTENSION_CATEGORY }}
+          VAL_REPO_NAME:             ${{ needs.set-variables.outputs.REPO_NAME }}
+          VAL_RAYCAST_BUG_LINK:      ${{ needs.set-variables.outputs.RAYCAST_BUG_LINK }}
+          VAL_RAYCAST_FEEDBACK_LINK: ${{ needs.set-variables.outputs.RAYCAST_FEEDBACK_LINK }}
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          if [ ! -s /tmp/branches.z ]; then
+            echo "No branches to process."
+            exit 0
+          fi
+
+          # Build mapping.json with jq (avoids YAML/heredoc parsing issues)
+          jq -n \
+            --arg a "$VAL_EXTENSION_NAME" \
+            --arg b "$VAL_EXTENSION_DESC" \
+            --arg c "$VAL_EXTENSION_CATEGORY" \
+            --arg d "$VAL_REPO_NAME" \
+            --arg e "$VAL_RAYCAST_BUG_LINK" \
+            --arg f "$VAL_RAYCAST_FEEDBACK_LINK" \
+            '{
+              "{EXTENSION_NAME}":        $a,
+              "{EXTENSION_DESC}":        $b,
+              "{EXTENSION_CATEGORY}":    $c,
+              "{REPO_NAME}":             $d,
+              "{RAYCAST_BUG_LINK}":      $e,
+              "{RAYCAST_FEEDBACK_LINK}": $f
+            } | with_entries(select(.value != null and .value != ""))' > /tmp/mapping.json || {
+            echo "::error::Failed to create mapping.json"
+            exit 1
+          }
+
+          echo "Replacement map:"
+          jq -r 'to_entries[] | "  " + .key + " -> " + (.value | if (.|length)>80 then (.[:77]+"...") else . end)' /tmp/mapping.json || true
+          
+          echo "Mapping JSON content:"
+          cat /tmp/mapping.json
+          
+          if [ "$(jq 'length' /tmp/mapping.json)" = "0" ]; then
+            echo "::notice::No values to replace; exiting."
+            exit 0
+          fi
+
+          # Use external replacement script - store absolute path and copy to temp location
+          SCRIPT_PATH="$(pwd)/.github/scripts/replace_placeholders.py"
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "::error::Replacement script not found at $SCRIPT_PATH"
+            exit 1
+          fi
+          
+          # Copy script to temp location so it's available across all branches
+          cp "$SCRIPT_PATH" /tmp/replace_placeholders.py
+          TEMP_SCRIPT_PATH="/tmp/replace_placeholders.py"
+          
+          # Test the script with a simple test
+          echo "Testing replacement script at $SCRIPT_PATH..."
+          python3 "$SCRIPT_PATH" /tmp/mapping.json > /tmp/test_output.txt 2>&1 || {
+            echo "::error::Failed to run replacement script"
+            cat /tmp/test_output.txt
+            exit 1
+          }
+          
+          # Debug: Check what's in a sample file
+          echo "Debug: Checking sample file content..."
+          if [ -f "README.md" ]; then
+            echo "README.md first few lines:"
+            head -5 README.md
+          fi
+          
+          while IFS= read -r -d '' BR; do
+            echo "::group::Branch ${BR}"
+            
+            # Skip if we're already on this branch
+            if [ "$(git branch --show-current)" = "${BR}" ]; then
+              echo "Already on branch ${BR}, skipping fetch..."
+            else
+              # Fetch and checkout branch with better error handling
+              if ! git fetch origin "${BR}:${BR}"; then
+                echo "::warning::Failed to fetch branch ${BR}, skipping..."
+                echo "::endgroup::"
+                continue
+              fi
+            fi
+            
+            if ! git checkout -f "${BR}"; then
+              echo "::warning::Failed to checkout branch ${BR}, skipping..."
+              echo "::endgroup::"
+              continue
+            fi
+
+            WORK="chore/update-vars/${BR//\//-}"
+            git branch -D "${WORK}" 2>/dev/null || true
+            
+            if ! git checkout -b "${WORK}" "${BR}"; then
+              echo "::warning::Failed to create work branch for ${BR}, skipping..."
+              echo "::endgroup::"
+              continue
+            fi
+
+            changed=$(python3 "$TEMP_SCRIPT_PATH" /tmp/mapping.json 2>&1 || echo "0")
+            echo "Files with changes: ${changed}"
+
+            if [ "${changed}" = "0" ]; then
+              echo "::notice::No changes found in ${BR}, cleaning up and continuing..."
+              git checkout -f "${BR}"
+              git branch -D "${WORK}" 2>/dev/null || true
+              echo "::endgroup::"
+              continue
+            fi
+            
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "::notice::DRY RUN - no commit for ${BR}"
+              git checkout -f "${BR}"
+              git branch -D "${WORK}" 2>/dev/null || true
+              echo "::endgroup::"
+              continue
+            fi
+
+            git add -A
+            git commit -m "chore: replace placeholders with configured variables"
+
+            # Direct commit to branch
+            git checkout "${BR}"
+            git merge --ff-only "${WORK}"
+            
+            repo="${{ github.repository }}"
+            url="https://x-access-token:${GH_TOKEN}@github.com/${repo}.git"
+            git push "${url}" "${BR}:${BR}"
+            
+            # Clean up work branch
+            git branch -D "${WORK}" 2>/dev/null || true
+            echo "::endgroup::"
+          done < /tmp/branches.z || {
+            echo "::warning::Some branches failed to process, but continuing..."
+          }
+          
+          echo "::notice::Completed processing all branches"
