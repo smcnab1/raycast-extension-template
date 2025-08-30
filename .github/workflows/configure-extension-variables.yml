@@ -1,0 +1,179 @@
+name: Configure Extension Variables
+
+on:
+  workflow_dispatch:
+    inputs:
+      extension_name:
+        description: "📝 Extension Name (display name in Raycast)"
+        required: true
+        type: string
+      repo_name:
+        description: |
+          📦 Repo name (above field, but with hyphen (e.g. word1-word2) - leave blank to use this repo automatically)
+        required: false
+        type: string
+      extension_desc:
+        description: "📖 Short description (1–2 sentences)"
+        required: true
+        type: string
+        default: "A Raycast extension to "
+      extension_category:
+        description: "📂 Category"
+        required: true
+        type: choice
+        options:
+          - Applications
+          - Communication
+          - Data
+          - Documentation
+          - Design Tools
+          - Developer Tools
+          - Finance
+          - Fun
+          - Media
+          - News
+          - Productivity
+          - Security
+          - System
+          - Web
+          - Other
+      raycast_feedback_link:
+        description: |
+          💬 Feedback link
+          e.g. `https://raycast.com/<you>/<extension>/feedback`
+        required: false
+        type: string
+      raycast_bug_link:
+        description: |
+          🐛 Bug report link
+          e.g. your Issues page `https://github.com/<you>/<repo>/issues/new/choose`
+        required: false
+        type: string
+      raycast_username:
+        description: |
+          👤 Raycast username/organisation (defaults to GitHub owner if omitted)
+        required: false
+        type: string
+
+permissions:
+  actions: write   # needed to create/update repository Variables
+  contents: read
+
+jobs:
+  set-variables:
+    name: Set repository variables
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create/Update variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ghOwner = context.repo.owner;
+            const ghRepo  = context.repo.repo;
+
+            // Inputs
+            const extName  = core.getInput('extension_name').trim();
+            const repoName = (core.getInput('repo_name') || ghRepo).trim();
+            const extDesc  = core.getInput('extension_desc').trim();
+            const extCat   = core.getInput('extension_category').trim();
+            const feedbackInput = (core.getInput('raycast_feedback_link') || '').trim();
+            const bugInput      = (core.getInput('raycast_bug_link') || '').trim();
+            const raycastUser   = (core.getInput('raycast_username') || ghOwner).trim();
+
+            // Helpers
+            const isURL = (s) => /^https?:\/\/[^\s]+$/i.test(s);
+            const slugify = (s) =>
+              s.toLowerCase()
+               .normalize('NFKD')
+               .replace(/[\u0300-\u036f]/g, '')   // strip accents
+               .replace(/&/g, ' and ')
+               .replace(/[^a-z0-9]+/g, '-')       // non-alnum to hyphen
+               .replace(/^-+|-+$/g, '')
+               .replace(/-{2,}/g, '-');
+
+            // Build Raycast page URL from name + username
+            const extSlug = slugify(extName);
+            const raycastPageUrl = `https://www.raycast.com/${encodeURIComponent(raycastUser)}/${encodeURIComponent(extSlug)}`;
+
+            // If user did not supply links, derive sane defaults that point to raycast/extensions issue templates
+            // Title seed like: "[Luxafor Controller] ..."
+            const titleSeed = `[${extName}] ...`;
+
+            const buildIssueURL = (template, labelsCsv) => {
+              const params = new URLSearchParams({
+                title: titleSeed,
+                template,
+                labels: labelsCsv,
+                'extension-url': raycastPageUrl
+              });
+              return `https://github.com/raycast/extensions/issues/new?${params.toString()}`;
+            };
+
+            const derivedBugLink = buildIssueURL('extension_bug_report.yml', 'extension,bug');
+            const derivedFeatureLink = buildIssueURL('extension_feature_request.yml', 'extension,feature request');
+
+            const bugLink = bugInput || derivedBugLink;
+            const feedbackLink = feedbackInput || derivedFeatureLink;
+
+            // Light validation warnings
+            const warnings = [];
+            if (feedbackInput && !isURL(feedbackInput)) warnings.push('RAYCAST_FEEDBACK_LINK does not look like a valid URL.');
+            if (bugInput && !isURL(bugInput)) warnings.push('RAYCAST_BUG_LINK does not look like a valid URL.');
+            if (extDesc.length > 280) warnings.push('EXTENSION_DESC is quite long (over 280 chars). Consider shortening.');
+
+            // Upsert helper
+            async function upsertVariable(owner, repo, name, value) {
+              if (!value && value !== '') {
+                core.info(`Skipping ${name} (undefined).`);
+                return 'skipped';
+              }
+              try {
+                await github.rest.actions.updateRepoVariable({ owner, repo, name, value });
+                core.info(`Updated ${name}`);
+                return 'updated';
+              } catch (err) {
+                if (err.status === 404) {
+                  await github.rest.actions.createRepoVariable({ owner, repo, name, value });
+                  core.info(`Created ${name}`);
+                  return 'created';
+                }
+                core.setFailed(`Failed to set ${name}: ${err.message}`);
+              }
+            }
+
+            // Apply variables (empty string means "skip" for optional ones? -> here we always set derived links)
+            const toSet = {
+              EXTENSION_NAME: extName,
+              EXTENSION_DESC: extDesc,
+              EXTENSION_CATEGORY: extCat,
+              REPO_NAME: repoName,
+              RAYCAST_BUG_LINK: bugLink,
+              RAYCAST_FEEDBACK_LINK: feedbackLink
+            };
+
+            const results = {};
+            for (const [name, value] of Object.entries(toSet)) {
+              results[name] = await upsertVariable(ghOwner, repoName, name, value);
+            }
+
+            // Summary
+            const preview = (v) => (String(v).length > 110 ? String(v).slice(0,107) + '...' : String(v));
+            core.summary
+              .addHeading('Repository Variables Updated')
+              .addTable([
+                [{ data: 'Name', header: true }, { data: 'Value (preview)', header: true }, { data: 'Action', header: true }],
+                ...Object.entries(toSet).map(([k, v]) => [k, preview(v), results[k] || 'skipped'])
+              ])
+              .addHeading('Derived URLs', 3)
+              .addList([
+                `Raycast page: ${raycastPageUrl}`,
+                `Bug link: ${bugLink}`,
+                `Feedback link: ${feedbackLink}`
+              ]);
+
+            if (warnings.length) {
+              core.summary.addHeading('Warnings', 3).addList(warnings);
+              warnings.forEach(w => core.warning(w));
+            }
+
+            await core.summary.write();
